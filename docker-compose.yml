@@ -1,0 +1,8 @@
+services:
+  vot-cli-service:
+    build:
+      context: .
+      network: host
+    volumes:
+      - ./scripts:/usr/src/app/scripts
+    command: ["sh", "/usr/src/app/scripts/update_vot_cli.sh"]
