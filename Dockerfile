@@ -37,7 +37,8 @@ RUN apk add --no-cache fish tree shadow micro eudev
 
 RUN pip install git+https://github.com/egigoka/commands --break-system-packages 
 RUN pip install git+https://github.com/egigoka/telegrame --break-system-packages
-RUN pip install git+https://github.com/Zulko/moviepy --break-system-packages
+RUN apk add --no-cache py3-opencv
+RUN pip install moviepy --no-deps --break-system-packages
 RUN pip install pytelegrambotapi --break-system-packages
 RUN pip install requests --break-system-packages
 RUN pip install ffmpeg-python --break-system-packages
