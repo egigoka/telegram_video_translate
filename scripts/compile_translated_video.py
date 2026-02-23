@@ -7,6 +7,39 @@ from commands import Video, KiB, MiB
 from video_utils import get_new_video_info
 
 
+def crop_thumbnail_to_video_ratio(thumbnail_path, video_width, video_height):
+    """Crop a landscape thumbnail to match a vertical video's aspect ratio (center crop)."""
+    try:
+        probe = ffmpeg.probe(thumbnail_path, select_streams='v:0')
+        thumb_w = int(probe['streams'][0]['width'])
+        thumb_h = int(probe['streams'][0]['height'])
+
+        target_ratio = video_width / video_height
+        new_w = int(thumb_h * target_ratio)
+
+        if new_w >= thumb_w:
+            return thumbnail_path
+
+        cropped_path = thumbnail_path.replace('.jpg', '_cropped.jpg')
+        x_offset = (thumb_w - new_w) // 2
+
+        result = subprocess.run([
+            'ffmpeg', '-i', thumbnail_path,
+            '-vf', f'crop={new_w}:{thumb_h}:{x_offset}:0',
+            '-y', cropped_path
+        ], capture_output=True)
+
+        if result.returncode == 0:
+            print(f"Cropped thumbnail {thumb_w}x{thumb_h} -> {new_w}x{thumb_h} for vertical video")
+            return cropped_path
+        else:
+            print(f"Thumbnail crop failed, using original")
+            return thumbnail_path
+    except Exception as e:
+        print(f"Thumbnail crop error: {e}")
+        return thumbnail_path
+
+
 def run_ffmpeg_with_fallback(build_command_fn):
     """
     Try QSV hardware encoding first, fall back to libx264 software encoding.
@@ -417,6 +450,9 @@ async def compile_translated_video(video_link, chat_id, title):
 
     if final_video:
         _, _, width, height = get_new_video_info(final_video)
+        # Crop thumbnail to match video aspect ratio for vertical videos
+        if thumbnail and height > width:
+            thumbnail = crop_thumbnail_to_video_ratio(thumbnail, width, height)
         return final_video, height, width, temp_dir, False, thumbnail
     else:
         return None, None, None, None, False, thumbnail
