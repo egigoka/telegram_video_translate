@@ -239,6 +239,7 @@ class OpenAiQuotaError(Exception):
 
 def get_thumbnail(url, folder):
     command = ["yt-dlp",
+               "--remote-components", "ejs:github",
                "-o", f"{folder}/_thumbnail.%(ext)s",
                "--write-thumbnail",
                "--skip-download",
@@ -349,7 +350,7 @@ async def delete_messages(messages):
 
 def get_video_title(url):
     result = subprocess.run(
-        ["yt-dlp", "--get-title", url],
+        ["yt-dlp", "--remote-components", "ejs:github", "--get-title", url],
         text=True,
         capture_output=True
     )
@@ -364,6 +365,7 @@ async def download_video(video_link, temp_video_dir, chat_id):
         try:
             yt_dlp_command = [
                 "yt-dlp",
+                "--remote-components", "ejs:github",
                 "-f", "bestvideo[height<=1080]+bestaudio",
                 "--merge-output-format", "mp4",
                 "--write-subs",              # Download subtitles
@@ -516,6 +518,8 @@ async def handle_document(message):
 
 
 async def compress_video(video_path, chat_id, title):
+    from compile_translated_video import run_ffmpeg_with_fallback
+
     b = Bench(verbose=True)
     b.end(prefix_string=f"start {current_function_name()}")
     ext = File.get_extension(video_path)
@@ -529,38 +533,32 @@ async def compress_video(video_path, chat_id, title):
                             f"new_video_bitrate: {new_video_bitrate}, "
                             f"new_audio_bitrate: {new_audio_bitrate}")
 
-        amd_device = get_amd_gpu_render_device()
-        if not amd_device:
-            amd_device = "/dev/dri/renderD128"
+        def build_compress_command(encoder, vf_template, hwaccel_args, extra_encoder_args):
+            vf = vf_template.format(w=new_width, h=new_height)
+            command = ["ffmpeg"]
+            command += hwaccel_args
+            command += [
+                "-i", video_path,
+                "-vf", vf,
+                "-c:v", encoder,
+            ]
+            command += extra_encoder_args
+            command += [
+                "-b:v", str(int(new_video_bitrate)),
+                "-b:a", str(int(new_audio_bitrate)),
+                "-c:s", "copy",
+                "-y",
+                compressed_video_path,
+            ]
+            return command
 
-        command = ["ffmpeg",
-                   "-hwaccel", "vaapi",
-                   "-vaapi_device", amd_device,
-                   "-i", video_path,
-                   "-vf", f'format=nv12,hwupload,scale_vaapi={new_width}:{new_height}',
-                   # "-c:v", "hevc_vaapi",
-                   "-c:v", "h264_vaapi",
-                   "-b:v", str(int(new_video_bitrate)),
-                   "-b:a", str(int(new_audio_bitrate)),
-                   "-c:s", "copy",
-                   "-y",
-                   compressed_video_path]
+        print("ffmpeg command (with QSV + fallback):")
+        b.end(prefix_string=f"command {current_function_name()}")
 
-        print("ffmpeg command:", end="")
-        result = ""
-        for sub in command:
-            if "[" in sub:
-                sub = f"\"{sub}\""
-            print(f" {sub}", end="")
-            result += f" {sub}"
-        print()
+        result, used_fallback = run_ffmpeg_with_fallback(build_compress_command)
 
-        if DEBUG:
-            await send_message(chat_id, title + " " + result)
-
-        b.end(prefix_string=f"command: {command} {current_function_name()}")
-
-        result = subprocess.run(command)
+        if used_fallback:
+            await send_message(chat_id, f"{title} HW ускорение недоступно, использую программный кодек")
 
         if DEBUG:
             await send_message(chat_id, str(result))
@@ -583,6 +581,7 @@ async def compress_video(video_path, chat_id, title):
 
 def get_intel_gpu_render_device():
     vendor_id = "0x8086"
+    return get_gpu_render_device(vendor_id)
 
 def get_amd_gpu_render_device():
     vendor_id = "0x1002"

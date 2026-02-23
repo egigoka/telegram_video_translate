@@ -6,6 +6,51 @@ import ffmpeg
 from commands import Video, KiB, MiB
 from video_utils import get_new_video_info
 
+
+def run_ffmpeg_with_fallback(build_command_fn):
+    """
+    Try QSV hardware encoding first, fall back to libx264 software encoding.
+
+    build_command_fn: callable(encoder, vf_template, hwaccel_args) -> list[str]
+        - encoder: 'h264_qsv' or 'libx264'
+        - vf_template: format string for -vf with {w} and {h} placeholders
+        - hwaccel_args: list of args to prepend (hwaccel flags), empty for software
+        - extra_encoder_args: list of extra encoder args (e.g. ['-preset', 'medium'])
+    Returns: (subprocess.CompletedProcess, used_fallback: bool)
+    """
+    from telegram_bot import get_intel_gpu_render_device
+
+    intel_device = get_intel_gpu_render_device()
+
+    # Try QSV first
+    if intel_device:
+        hwaccel_args = ['-hwaccel', 'qsv', '-qsv_device', intel_device]
+        env = os.environ.copy()
+        env['LIBVA_DRIVER_NAME'] = 'iHD'
+        command = build_command_fn(
+            encoder='h264_qsv',
+            vf_template='format=nv12,scale={w}:{h}',
+            hwaccel_args=hwaccel_args,
+            extra_encoder_args=[]
+        )
+        print(f"Trying QSV encoding: {' '.join(command)}")
+        result = subprocess.run(command, env=env)
+        if result.returncode == 0:
+            return result, False
+
+        print(f"QSV encoding failed (return code {result.returncode}), falling back to software encoding")
+
+    # Software fallback
+    command = build_command_fn(
+        encoder='libx264',
+        vf_template='scale={w}:{h}',
+        hwaccel_args=[],
+        extra_encoder_args=['-preset', 'medium']
+    )
+    print(f"Using software encoding: {' '.join(command)}")
+    result = subprocess.run(command)
+    return result, True
+
 MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024
 MIN_AUDIO_BITRATE = 32 * KiB
 MAX_AUDIO_BITRATE = 256 * KiB
@@ -143,127 +188,20 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
                                 original_subs_lang, output_path, subs_real_lang, chat_id, title):
     """
     Assemble final video with all streams: video, mixed audio, original audio, and subtitles.
-    IMPORTANT: This preserves all streams to avoid losing video/audio/subs!
-
-    Note: Original audio comes from the video_path input (0:a), not a separate file.
-    Now includes BOTH translated and original subtitle tracks!
-
-    Args:
-        original_subs_lang: Language code of original subtitles (e.g., 'en', 'ru', 'es')
+    Uses QSV hardware encoding with automatic software fallback.
     """
     from telegram_bot import (
-        get_amd_gpu_render_device, get_video_codec,
+        get_video_codec,
         map_lang, TRANSLATION_LANG, SUBS_LANG, DEBUG, send_message
     )
 
     video_bitrate, audio_bitrate, width, height = get_new_video_info(video_path)
 
-    amd_device = get_amd_gpu_render_device()
-    if not amd_device:
-        amd_device = "/dev/dri/renderD128"
-
     video_input_codec = get_video_codec(video_path)
 
-    command = ["ffmpeg"]
-
-    # Hardware acceleration setup based on codec
-    if video_input_codec == "av1":
-        # AV1: use software decoder (libdav1d) because hardware decoding has issues
-        # But initialize VAAPI device for hardware encoding via hwupload
-        command += [
-            "-init_hw_device", f"vaapi=va:{amd_device}",
-            "-filter_hw_device", "va",
-            "-c:v", "libdav1d"
-        ]
-        print(f"Using software decoding for AV1 input with hardware encoding")
-    elif video_input_codec == "vp9":
-        # VP9: use software decoder (libvpx-vp9) because hardware decoding has issues
-        # But initialize VAAPI device for hardware encoding via hwupload
-        command += [
-            "-init_hw_device", f"vaapi=va:{amd_device}",
-            "-filter_hw_device", "va",
-            "-c:v", "libvpx-vp9"
-        ]
-        print(f"Using software decoding for VP9 input with hardware encoding")
-    elif amd_device: # For other codecs, use hardware acceleration for decoding
-        command += [
-            '-hwaccel', 'vaapi',
-            '-vaapi_device', amd_device
-        ]
-        print(f"Using hardware acceleration for {video_input_codec} input")
-
-    # Input files
-    command += [
-        '-i', video_path,       # 0: Original video (with video + original audio)
-        '-i', mixed_audio_path, # 1: Pre-mixed audio (30% original + 100% translated)
-    ]
-
-    # Add subtitle tracks if available
+    # Determine subtitle inputs
     has_translated_subs = translated_subs_path and os.path.exists(f"{translated_subs_path}.srt")
     has_original_subs = original_subs_path and os.path.exists(original_subs_path)
-
-    subtitle_input_index = 2  # Track which input index we're at
-    translated_subs_index = None
-    original_subs_index = None
-
-    if has_translated_subs:
-        command += ['-i', f"{translated_subs_path}.srt"]
-        translated_subs_index = subtitle_input_index
-        subtitle_input_index += 1
-        print(f"Adding translated subtitles at index {translated_subs_index}")
-
-    if has_original_subs:
-        command += ['-i', original_subs_path]
-        original_subs_index = subtitle_input_index
-        subtitle_input_index += 1
-        print(f"Adding original subtitles at index {original_subs_index}")
-
-    # Video encoding - always use hardware encoding with VAAPI
-    command += [
-        '-vf', f'format=nv12,hwupload,scale_vaapi={width}:{height}',
-        '-c:v', 'h264_vaapi',
-        '-b:v', str(int(video_bitrate)),
-        # Note: -crf, -preset, and -profile:v are not valid for h264_vaapi
-    ]
-    print(f"Using hardware encoding (h264_vaapi) for output")
-
-    # Audio codec
-    command += ['-c:a', 'aac', '-b:a', str(int(audio_bitrate))]
-
-    # Stream mapping - IMPORTANT: Map all streams to preserve them!
-    command += [
-        '-map', '0:v',  # OUTPUT STREAM 0: Video from original
-        '-map', '1:a',  # OUTPUT STREAM 1: Mixed audio (translated + 30% original)
-        '-map', '0:a',  # OUTPUT STREAM 2: Original audio track
-    ]
-
-    # Map subtitle streams
-    if has_translated_subs:
-        command += [
-            '-map', f'{translated_subs_index}:s',  # OUTPUT STREAM 3: Translated subtitles
-            '-c:s:0', 'mov_text'                   # Subtitle codec for first subtitle track
-        ]
-
-    if has_original_subs:
-        subs_stream_num = 1 if has_translated_subs else 0  # Second or first subtitle stream
-        command += [
-            '-map', f'{original_subs_index}:s',           # OUTPUT STREAM 4 (or 3): Original subtitles
-            f'-c:s:{subs_stream_num}', 'mov_text'         # Subtitle codec for this track
-        ]
-
-    # Set default streams: mixed audio and translated subtitles
-    command += [
-        '-disposition:v:0', 'default',    # Video stream is default (only one anyway)
-        '-disposition:a:0', 'default',    # Stream 1: Mixed audio is default
-        '-disposition:a:1', '0',          # Stream 2: Original audio is NOT default
-    ]
-
-    # Set subtitle defaults
-    if has_translated_subs:
-        command += ['-disposition:s:0', 'default']  # Translated subtitles are default
-    if has_original_subs:
-        subs_disposition_index = 1 if has_translated_subs else 0
-        command += [f'-disposition:s:{subs_disposition_index}', '0']  # Original subs NOT default
 
     # Metadata
     try:
@@ -271,66 +209,131 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
     except (KeyError, TypeError):
         subs_real_lang_mapped = map_lang(SUBS_LANG)
 
-    command += [
-        '-metadata:s:a:0', f'language={map_lang(TRANSLATION_LANG)}',  # Mixed audio track
-        '-metadata:s:a:1', f'language={subs_real_lang_mapped}',       # Original audio track
-    ]
+    def build_command(encoder, vf_template, hwaccel_args, extra_encoder_args):
+        command = ["ffmpeg"]
 
-    # Add subtitle metadata
-    subtitle_stream_counter = 0
-    if has_translated_subs:
+        # For software decoding of AV1/VP9, add decoder flags (no hwaccel for decoding)
+        if video_input_codec == "av1":
+            command += ["-c:v", "libdav1d"]
+            print(f"Using software decoding for AV1 input")
+        elif video_input_codec == "vp9":
+            command += ["-c:v", "libvpx-vp9"]
+            print(f"Using software decoding for VP9 input")
+
+        # Add hwaccel args (QSV flags for hw, empty for software)
+        command += hwaccel_args
+
+        # Input files
         command += [
-            f'-metadata:s:s:{subtitle_stream_counter}', f'language={map_lang(TRANSLATION_LANG)}',  # FIXED: Translated subs in Russian
-            f'-metadata:s:s:{subtitle_stream_counter}', 'title=Translated',
-        ]
-        subtitle_stream_counter += 1
-
-    if has_original_subs:
-        # Use detected language or default to 'und' (undefined) if not detected
-        original_lang_code = original_subs_lang if original_subs_lang else 'und'
-        # Create a human-readable title
-        lang_names = {
-            'en': 'English',
-            'ru': 'Russian',
-            'es': 'Spanish',
-            'fr': 'French',
-            'de': 'German',
-            'ja': 'Japanese',
-            'zh': 'Chinese',
-            'ko': 'Korean',
-            'pt': 'Portuguese',
-            'it': 'Italian',
-            'ar': 'Arabic',
-            'hi': 'Hindi',
-        }
-        lang_display = lang_names.get(original_subs_lang, original_subs_lang.upper() if original_subs_lang else 'Unknown')
-
-        command += [
-            f'-metadata:s:s:{subtitle_stream_counter}', f'language={original_lang_code}',
-            f'-metadata:s:s:{subtitle_stream_counter}', f'title=Original ({lang_display})',
+            '-i', video_path,       # 0: Original video (with video + original audio)
+            '-i', mixed_audio_path, # 1: Pre-mixed audio (30% original + 100% translated)
         ]
 
-    command += [
-        '-y',
-        output_path
-    ]
+        # Add subtitle tracks if available
+        subtitle_input_index = 2
+        translated_subs_index = None
+        original_subs_index = None
 
-    # Debug output
+        if has_translated_subs:
+            command += ['-i', f"{translated_subs_path}.srt"]
+            translated_subs_index = subtitle_input_index
+            subtitle_input_index += 1
+
+        if has_original_subs:
+            command += ['-i', original_subs_path]
+            original_subs_index = subtitle_input_index
+            subtitle_input_index += 1
+
+        # Video encoding
+        vf = vf_template.format(w=width, h=height)
+        command += [
+            '-vf', vf,
+            '-c:v', encoder,
+            '-b:v', str(int(video_bitrate)),
+        ]
+        command += extra_encoder_args
+
+        # Audio codec
+        command += ['-c:a', 'aac', '-b:a', str(int(audio_bitrate))]
+
+        # Stream mapping
+        command += [
+            '-map', '0:v',
+            '-map', '1:a',
+            '-map', '0:a',
+        ]
+
+        # Map subtitle streams
+        if has_translated_subs:
+            command += [
+                '-map', f'{translated_subs_index}:s',
+                '-c:s:0', 'mov_text'
+            ]
+
+        if has_original_subs:
+            subs_stream_num = 1 if has_translated_subs else 0
+            command += [
+                '-map', f'{original_subs_index}:s',
+                f'-c:s:{subs_stream_num}', 'mov_text'
+            ]
+
+        # Set default streams
+        command += [
+            '-disposition:v:0', 'default',
+            '-disposition:a:0', 'default',
+            '-disposition:a:1', '0',
+        ]
+
+        if has_translated_subs:
+            command += ['-disposition:s:0', 'default']
+        if has_original_subs:
+            subs_disposition_index = 1 if has_translated_subs else 0
+            command += [f'-disposition:s:{subs_disposition_index}', '0']
+
+        # Metadata
+        command += [
+            '-metadata:s:a:0', f'language={map_lang(TRANSLATION_LANG)}',
+            '-metadata:s:a:1', f'language={subs_real_lang_mapped}',
+        ]
+
+        subtitle_stream_counter = 0
+        if has_translated_subs:
+            command += [
+                f'-metadata:s:s:{subtitle_stream_counter}', f'language={map_lang(TRANSLATION_LANG)}',
+                f'-metadata:s:s:{subtitle_stream_counter}', 'title=Translated',
+            ]
+            subtitle_stream_counter += 1
+
+        if has_original_subs:
+            original_lang_code = original_subs_lang if original_subs_lang else 'und'
+            lang_names = {
+                'en': 'English', 'ru': 'Russian', 'es': 'Spanish',
+                'fr': 'French', 'de': 'German', 'ja': 'Japanese',
+                'zh': 'Chinese', 'ko': 'Korean', 'pt': 'Portuguese',
+                'it': 'Italian', 'ar': 'Arabic', 'hi': 'Hindi',
+            }
+            lang_display = lang_names.get(original_subs_lang, original_subs_lang.upper() if original_subs_lang else 'Unknown')
+            command += [
+                f'-metadata:s:s:{subtitle_stream_counter}', f'language={original_lang_code}',
+                f'-metadata:s:s:{subtitle_stream_counter}', f'title=Original ({lang_display})',
+            ]
+
+        command += ['-y', output_path]
+        return command
+
+    # Debug output before running
     if DEBUG:
-        print("ffmpeg command:", end="")
-        cmd_str = ""
-        for sub in command:
-            if "[" in sub:
-                sub = f"\"{sub}\""
-            print(f" {sub}", end="")
-            cmd_str += f" {sub}"
-        print()
-
+        preview_cmd = build_command('h264_qsv', 'format=nv12,scale={w}:{h}', [], [])
+        cmd_str = " ".join(f'"{s}"' if "[" in s else s for s in preview_cmd)
         await send_message(chat_id, title + " " + cmd_str)
 
-    print("Running ffmpeg command (this may take a while)...")
-    print(f"Command: {' '.join(command)}")
-    result = subprocess.run(command)  # Show output in real-time
+    print("Running ffmpeg with QSV + fallback...")
+    result, used_fallback = run_ffmpeg_with_fallback(build_command)
+
+    if used_fallback:
+        print("Used software encoding fallback (libx264)")
+        await send_message(chat_id, f"{title} HW ускорение недоступно, использую программный кодек")
+
     print(f"ffmpeg completed with return code: {result.returncode}")
 
     if result.returncode == 0:
