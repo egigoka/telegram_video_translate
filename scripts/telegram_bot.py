@@ -494,8 +494,7 @@ def current_function_name():
 
 @BOT.message_handler(commands=['start'])
 async def send_welcome(message):
-    await send_message(message.chat.id,
-                 "Привет! Я бот, который переводит видео. Просто отправь мне ссылку на видео, и я переведу его.")
+    await send_message(message.chat.id, MESSAGES.welcome)
 
 
 @BOT.message_handler(content_types=['document'])
@@ -558,7 +557,7 @@ async def compress_video(video_path, chat_id, title):
         result, used_fallback = run_ffmpeg_with_fallback(build_compress_command)
 
         if used_fallback:
-            await send_message(chat_id, f"{title} HW ускорение недоступно, использую программный кодек")
+            await send_message(chat_id, f"{title} {MESSAGES.hw_accel_unavailable}")
 
         if DEBUG:
             await send_message(chat_id, str(result))
@@ -568,8 +567,7 @@ async def compress_video(video_path, chat_id, title):
 
         if os.path.getsize(compressed_video_path) > MAX_VIDEO_SIZE:
             STATUS_MANAGER.add(chat_id,
-                await send_message(chat_id, f"{title} Сжалось фигово: {int(os.path.getsize(compressed_video_path) / MiB) + 1} мегов. "
-                                      f"Пробуем ещё раз"))
+                await send_message(chat_id, f"{title} {MESSAGES.compression_retry.format(int(os.path.getsize(compressed_video_path) / MiB) + 1)}"))
 
             new_audio_bitrate = int(new_audio_bitrate * 0.9)
             new_audio_bitrate = MIN_AUDIO_BITRATE if new_audio_bitrate < MIN_AUDIO_BITRATE else new_audio_bitrate
@@ -631,7 +629,7 @@ async def handle_message(message):
         title = ""
 
     try:
-        STATUS_MANAGER.add(chat_id, await send_message(chat_id, title + " Паажалуйста паажите..."))
+        STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.processing_please_wait}"))
         b.end(prefix_string=f"start {current_function_name()}")
 
         video_path, video_height, video_width, temp_dir, known_error, thumbnail = \
@@ -641,7 +639,7 @@ async def handle_message(message):
 
         if not video_path:
             if not known_error:
-                await send_message(chat_id, title + " Не перевелось, бля, сорян, мусорян. ")
+                await send_message(chat_id, f"{title} {MESSAGES.translation_failed}")
             return
 
         b.end(prefix_string=f"completed {current_function_name()}")
@@ -650,16 +648,15 @@ async def handle_message(message):
 
             if os.path.getsize(video_path) > MAX_VIDEO_SIZE:
                 STATUS_MANAGER.add(chat_id,
-                    await send_message(chat_id, f"{title} Видос слишком большой - {int(os.path.getsize(video_path) / MiB)} мегов. "
-                                          f"Пробую сжать до {int(MAX_VIDEO_SIZE / MiB)}."))
+                    await send_message(chat_id, f"{title} {MESSAGES.video_too_large.format(int(os.path.getsize(video_path) / MiB), int(MAX_VIDEO_SIZE / MiB))}"))
                 video_path, video_width, video_height = await compress_video(video_path, chat_id, title)
 
             if video_path is None:
-                await send_message(chat_id, title + " Бля, не сжалось, сорян, мусорян")
+                await send_message(chat_id, f"{title} {MESSAGES.compression_failed}")
                 return
 
             # with open(video_path, 'rb') as video:
-            STATUS_MANAGER.add(chat_id, await send_message(chat_id, title + " Отправляю видос, готовься-cъ"))
+            STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.sending_video}"))
 
             for i in range(10):
                 print()
@@ -676,7 +673,7 @@ async def handle_message(message):
                 print()
 
             caption = f"{translated_title}\n\n" if translated_title is not None else ""
-            caption += f"{title}\n\nОригинальное видео: {link}"
+            caption += f"{title}\n\n{MESSAGES.original_video}: {link}"
 
             print(f"Compiled video path: {video_path}")
             if DEBUG:
@@ -694,7 +691,7 @@ async def handle_message(message):
             if Dir.exists(temp_dir):
                 Dir.delete(temp_dir)
         else:
-            await send_message(chat_id, title + " Чот пошло не так, бля, сорян, мусорян. ")
+            await send_message(chat_id, f"{title} {MESSAGES.something_went_wrong}")
 
     except Exception as e:
         # Get full traceback
@@ -710,7 +707,7 @@ async def handle_message(message):
 
         # Send user-friendly message to the user
         try:
-            await send_message(chat_id, title + " К сожалению, произошла непредвиденная ошибка. Мы уже работаем над её устранением. Пожалуйста, попробуйте позже.")
+            await send_message(chat_id, f"{title} {MESSAGES.unexpected_error}")
         except telebot.apihelper.ApiException as user_send_error:
             print(f"Failed to send user-friendly error message to user {chat_id}: {user_send_error}")
 
