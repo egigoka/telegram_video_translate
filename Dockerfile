@@ -16,7 +16,8 @@ RUN apk add --no-cache py3-psutil
 RUN apk add --no-cache py3-cffi
 RUN apk add --no-cache dav1d
 RUN apk add --no-cache mesa-va-gallium mesa-dri-gallium libva libva-utils
-RUN apk add --no-cache yt-dlp
+RUN apk add --no-cache deno
+RUN pip install yt-dlp --break-system-packages
 RUN apk add --no-cache jq
 RUN apk add --no-cache ffmpeg
 RUN apk add --no-cache curl
@@ -31,9 +32,7 @@ RUN usermod -aG render root
 # debug
 RUN apk add --no-cache fish tree shadow micro eudev
 
-# intel shits itself on filters
-# RUN apk add --no-cache intel-media-driver libva-intel-driver
-# RUN apk add --no-cache libva-utils intel-media-driver  # intel goes oom despite all ram available
+RUN apk add --no-cache intel-media-driver intel-media-sdk
 
 RUN pip install git+https://github.com/egigoka/commands --break-system-packages 
 RUN pip install git+https://github.com/egigoka/telegrame --break-system-packages
