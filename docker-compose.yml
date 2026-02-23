@@ -5,4 +5,8 @@ services:
       network: host
     volumes:
       - ./scripts:/usr/src/app/scripts
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
     command: ["sh", "/usr/src/app/scripts/update_vot_cli.sh"]
+    labels:
+          - "com.centurylinklabs.watchtower.enable=false"
