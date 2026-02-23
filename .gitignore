@@ -1,5 +1,17 @@
 # secrets
-scripts/secrets.py
+scripts/secrets_.py
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+
+# Profiling
+*.prof
+
+# Session files
+*.session
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
