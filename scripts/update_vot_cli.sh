@@ -13,3 +13,8 @@ chmod +x /usr/src/app/scripts/downloaded_script.sh
 echo "Starting Telegram bot"
 python3 ./scripts/telegram_bot.py
 echo "Telegram bot exited :-("
+
+while true; do
+	sleep 60
+	echo "telegram down i guess"
+done
