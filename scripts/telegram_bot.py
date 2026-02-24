@@ -16,6 +16,7 @@ from json import JSONDecodeError
 from commands import Video, File, KiB, MiB, Bench, Dir, Str, OS, Print, Console, Int
 from secrets_ import TELEGRAM_TOKEN, ADMIN_CHAT_ID, APP_ID, APP_API_HASH, OPENAI_API_KEY
 from messages import Messages
+from user_settings import UserSettings, LANG_LABELS, LANG_CONFIRM, SUPPORTED_LANGS
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 import logging
@@ -37,47 +38,81 @@ logging.getLogger('openai').setLevel(logging.WARNING)
 
 # Status Message Manager Singleton
 class StatusMessageManager:
-    """Singleton class to manage status messages for the Telegram bot per chat"""
+    """Manages a single updatable status message per chat_id.
+
+    Non-debug: sends one message, edits it in-place for updates, deletes when done.
+    Debug: sends separate messages each time, deletes them all when done.
+    """
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._messages_by_chat = {}
+            # Maps chat_id -> {
+            #   'user_msg_ids': [int],      # message ids in user's chat
+            #   'admin_msg_ids': [int],      # message ids in admin chat
+            # }
+            cls._instance._status = {}
         return cls._instance
 
-    def add(self, chat_id, messages):
-        """Add message(s) to the status message list for a specific chat"""
-        if chat_id not in self._messages_by_chat:
-            self._messages_by_chat[chat_id] = []
+    def _extract_ids(self, chat_id, messages):
+        """Extract user and admin message IDs from a list of sent messages."""
+        user_ids = []
+        admin_ids = []
+        for msg in messages:
+            if msg.chat.id == chat_id:
+                user_ids.append(msg.message_id)
+            elif msg.chat.id == ADMIN_CHAT_ID:
+                admin_ids.append(msg.message_id)
+        return user_ids, admin_ids
 
-        if isinstance(messages, list):
-            self._messages_by_chat[chat_id].extend(messages)
+    async def send_or_update(self, chat_id, text):
+        """Send a new status message or update the existing one."""
+        if DEBUG:
+            await send_message(chat_id, text)
+            return
+
+        if chat_id in self._status:
+            # Non-debug: edit existing status message in-place
+            entry = self._status[chat_id]
+            if entry['user_msg_ids']:
+                try:
+                    await BOT.edit_message_text(
+                        text, chat_id=chat_id, message_id=entry['user_msg_ids'][0])
+                    print(f"[TG] Updated msg_id={entry['user_msg_ids'][0]} chat_id={chat_id}: {text[:80]}")
+                except Exception as e:
+                    print(f"[TG] Failed to update msg_id={entry['user_msg_ids'][0]} chat_id={chat_id}: {e}")
+            if entry['admin_msg_ids'] and chat_id != ADMIN_CHAT_ID:
+                try:
+                    await BOT.edit_message_text(
+                        text, chat_id=ADMIN_CHAT_ID, message_id=entry['admin_msg_ids'][0])
+                    print(f"[TG] Updated msg_id={entry['admin_msg_ids'][0]} chat_id={ADMIN_CHAT_ID}: {text[:80]}")
+                except Exception as e:
+                    print(f"[TG] Failed to update msg_id={entry['admin_msg_ids'][0]} chat_id={ADMIN_CHAT_ID}: {e}")
         else:
-            self._messages_by_chat[chat_id].append(messages)
-        return messages
+            # Non-debug: send first status message and track it
+            messages = await send_message(chat_id, text)
+            user_ids, admin_ids = self._extract_ids(chat_id, messages)
+            if user_ids:
+                self._status[chat_id] = {'user_msg_ids': user_ids, 'admin_msg_ids': admin_ids}
+            else:
+                print(f"Error: could not track status message for chat_id {chat_id}")
 
     async def clear(self, chat_id):
-        """Clear all status messages for a specific chat by deleting them from Telegram"""
-        if chat_id not in self._messages_by_chat:
+        """Delete all tracked status messages for a chat. Skipped in DEBUG mode."""
+        if chat_id not in self._status:
             return
 
         if not DEBUG:
-            for messages in self._messages_by_chat[chat_id]:
-                await delete_messages(messages)
+            entry = self._status[chat_id]
+            for msg_id in entry['user_msg_ids']:
+                await telegram_delete_message(BOT, chat_id, msg_id)
+            if chat_id != ADMIN_CHAT_ID:
+                for msg_id in entry['admin_msg_ids']:
+                    await telegram_delete_message(BOT, ADMIN_CHAT_ID, msg_id)
 
-        self._messages_by_chat[chat_id].clear()
-        del self._messages_by_chat[chat_id]
+        del self._status[chat_id]
 
-    def get_all(self, chat_id):
-        """Get all current status messages for a specific chat"""
-        return self._messages_by_chat.get(chat_id, []).copy()
-
-    def reset(self, chat_id):
-        """Reset the message list for a specific chat without deleting from Telegram"""
-        if chat_id in self._messages_by_chat:
-            self._messages_by_chat[chat_id].clear()
-            del self._messages_by_chat[chat_id]
 
 # Initialize the Telegram bot with your token
 BOT = AsyncTeleBot(TELEGRAM_TOKEN)
@@ -89,9 +124,10 @@ MAX_AUDIO_BITRATE = 256 * KiB
 LANG = 'ru'
 MESSAGES = Messages(LANG)
 TRANSLATION_LANG = 'ru'
+USER_SETTINGS = UserSettings()
 SUBS_LANG = 'en'
 ADDITIONAL_VIDEO_BITRATE_MULTIPLIER = 0.95
-DEBUG = True
+DEBUG = False
 
 OPENAI_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY)
 
@@ -108,12 +144,14 @@ async def telegram_send_message(telegram_api_object, chat_id, text,
     for text in texts:
         for i in range(10):
             try:
-                output.append(await telegram_api_object.send_message(chat_id=chat_id, text=text,
+                msg = await telegram_api_object.send_message(chat_id=chat_id, text=text,
                                                                disable_web_page_preview=disable_web_page_preview,
                                                                reply_to_message_id=reply_to_message_id,
                                                                reply_markup=reply_markup, parse_mode=parse_mode,
                                                                disable_notification=disable_notification,
-                                                               timeout=300))
+                                                               timeout=300)
+                print(f"[TG] Sent msg_id={msg.message_id} chat_id={chat_id}: {text[:80]}")
+                output.append(msg)
                 break
             except (requests.exceptions.ReadTimeout, 
                     telebot.asyncio_helper.RequestTimeout):
@@ -175,8 +213,6 @@ async def async_send_video(
     except Exception as e:
         print(f"Error sending video: {e}")
         raise
-
-    await clear_status_messages(chat_id)
 
     return messages
 
@@ -267,64 +303,14 @@ def progress(bytes_sent, total):
     print(bytes_sent, "/", total, end="\r", flush=True)
 
 
-async def send_video(
-    chat_id,
-    video,
-    supports_streaming,
-    height,
-    width,
-    caption,
-    thumbnail
-):
-    video_attributes = DocumentAttributeVideo(
-        w=width,
-        h=height,
-        supports_streaming=supports_streaming,
-        duration=0
-    )
-    file_attributes = DocumentAttributeFilename(file_name=video)
-    attributes = [video_attributes, file_attributes]
-
-    async def send_file_to_chat(target_chat_id):
-        return await TELETHON_CLIENT.send_file(
-            entity=target_chat_id,
-            file=video,
-            attributes=attributes,
-            progress_callback=progress,
-            supports_streaming=supports_streaming,
-            caption=caption,
-            thumb=thumbnail
-        )
-
-    messages = []
-    # Remove async with context manager
-    try:
-        # Ensure client is connected first
-        if not TELETHON_CLIENT.is_connected():
-            await TELETHON_CLIENT.connect()
-
-        messages.append(await send_file_to_chat(chat_id))
-
-        if chat_id != ADMIN_CHAT_ID:
-            messages.append(await send_file_to_chat(ADMIN_CHAT_ID))
-
-    finally:
-        # Optionally disconnect if needed
-        if TELETHON_CLIENT.is_connected():
-            await TELETHON_CLIENT.disconnect()
-
-    await clear_status_messages(chat_id)
-    return messages
-
-
 async def send_message(chat_id, text):
+    """Send a message to the user (and admin mirror)."""
     print(chat_id, chat_id == ADMIN_CHAT_ID, text)
     messages = await telegram_send_message(BOT, chat_id=chat_id, text=text)
     if chat_id != ADMIN_CHAT_ID:
         messages += await telegram_send_message(BOT,
                                            chat_id=ADMIN_CHAT_ID,
                                            text=text)
-    await clear_status_messages(chat_id)
     return messages
 
 
@@ -333,6 +319,7 @@ async def telegram_delete_message(telegram_api: telebot.TeleBot, chat_id, messag
     for i in range(retries):
         try:
             result = await telegram_api.delete_message(chat_id, message_id)
+            print(f"[TG] Deleted msg_id={message_id} chat_id={chat_id}")
             return result
         except telebot.asyncio_helper.RequestTimeout as e:
             print(f"Request timeout while deleting message: {e}")
@@ -342,10 +329,6 @@ async def telegram_delete_message(telegram_api: telebot.TeleBot, chat_id, messag
             return None
     return None
 
-
-async def delete_messages(messages):
-    for message in messages:
-        await telegram_delete_message(BOT, message.chat.id, message.message_id)
 
 
 def get_video_title(url):
@@ -394,11 +377,13 @@ async def download_video(video_link, temp_video_dir, chat_id):
             break
         except subprocess.CalledProcessError:
             attempts += 1
-            STATUS_MANAGER.add(chat_id, await send_message(chat_id,
-                                                f'{MESSAGES.loading_error} {MESSAGES.retrying}{attempts}'))
+            msgs = USER_SETTINGS.get_messages(chat_id)
+            await STATUS_MANAGER.send_or_update(chat_id,
+                                                f'{msgs.loading_error} {msgs.retrying}{attempts}')
             time.sleep(5)
     else:
-        STATUS_MANAGER.add(chat_id, await send_message(chat_id, f'{MESSAGES.fail} {MESSAGES.loading_error}'))
+        msgs = USER_SETTINGS.get_messages(chat_id)
+        await STATUS_MANAGER.send_or_update(chat_id, f'{msgs.fail} {msgs.loading_error}')
         return None, None, None
 
     # Find downloaded subtitles (any language)
@@ -492,9 +477,38 @@ def current_function_name():
     return inspect.stack()[1].function
 
 
+def make_lang_keyboard():
+    markup = telebot.types.InlineKeyboardMarkup()
+    buttons = [telebot.types.InlineKeyboardButton(text=LANG_LABELS[lang], callback_data=f"setlang:{lang}")
+               for lang in SUPPORTED_LANGS]
+    markup.row(*buttons)
+    return markup
+
+
 @BOT.message_handler(commands=['start'])
 async def send_welcome(message):
-    await send_message(message.chat.id, MESSAGES.welcome)
+    chat_id = message.chat.id
+    msgs = USER_SETTINGS.get_messages(chat_id)
+    await BOT.send_message(chat_id, msgs.welcome, reply_markup=make_lang_keyboard())
+
+
+@BOT.message_handler(commands=['lang'])
+async def change_language(message):
+    chat_id = message.chat.id
+    msgs = USER_SETTINGS.get_messages(chat_id)
+    await BOT.send_message(chat_id, msgs.welcome, reply_markup=make_lang_keyboard())
+
+
+@BOT.callback_query_handler(func=lambda call: call.data.startswith("setlang:"))
+async def handle_lang_callback(call):
+    lang = call.data.split(":")[1]
+    if lang not in SUPPORTED_LANGS:
+        return
+    chat_id = call.message.chat.id
+    USER_SETTINGS.set_lang(chat_id, lang)
+    confirm_text = LANG_CONFIRM[lang]
+    await BOT.edit_message_text(confirm_text, chat_id=chat_id, message_id=call.message.message_id)
+    await BOT.answer_callback_query(call.id)
 
 
 @BOT.message_handler(content_types=['document'])
@@ -557,7 +571,8 @@ async def compress_video(video_path, chat_id, title):
         result, used_fallback = run_ffmpeg_with_fallback(build_compress_command)
 
         if used_fallback:
-            await send_message(chat_id, f"{title} {MESSAGES.hw_accel_unavailable}")
+            msgs = USER_SETTINGS.get_messages(chat_id)
+            await send_message(chat_id, f"{title} {msgs.hw_accel_unavailable}")
 
         if DEBUG:
             await send_message(chat_id, str(result))
@@ -566,8 +581,8 @@ async def compress_video(video_path, chat_id, title):
             return None
 
         if os.path.getsize(compressed_video_path) > MAX_VIDEO_SIZE:
-            STATUS_MANAGER.add(chat_id,
-                await send_message(chat_id, f"{title} {MESSAGES.compression_retry.format(int(os.path.getsize(compressed_video_path) / MiB) + 1)}"))
+            msgs = USER_SETTINGS.get_messages(chat_id)
+            await STATUS_MANAGER.send_or_update(chat_id, f"{title} {msgs.compression_retry.format(int(os.path.getsize(compressed_video_path) / MiB) + 1)}")
 
             new_audio_bitrate = int(new_audio_bitrate * 0.9)
             new_audio_bitrate = MIN_AUDIO_BITRATE if new_audio_bitrate < MIN_AUDIO_BITRATE else new_audio_bitrate
@@ -628,18 +643,22 @@ async def handle_message(message):
     except Exception:
         title = ""
 
+    msgs = USER_SETTINGS.get_messages(chat_id)
+    translation_lang = USER_SETTINGS.get_translation_lang(chat_id)
+
     try:
-        STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.processing_please_wait}"))
+        await STATUS_MANAGER.send_or_update(chat_id, f"{title} {msgs.processing_please_wait}")
         b.end(prefix_string=f"start {current_function_name()}")
 
         video_path, video_height, video_width, temp_dir, known_error, thumbnail = \
             await compile_translated_video(link,
                                      chat_id,
-                                     title)
+                                     title,
+                                     STATUS_MANAGER)
 
         if not video_path:
             if not known_error:
-                await send_message(chat_id, f"{title} {MESSAGES.translation_failed}")
+                await send_message(chat_id, f"{title} {msgs.translation_failed}")
             return
 
         b.end(prefix_string=f"completed {current_function_name()}")
@@ -647,22 +666,21 @@ async def handle_message(message):
         if os.path.exists(video_path):
 
             if os.path.getsize(video_path) > MAX_VIDEO_SIZE:
-                STATUS_MANAGER.add(chat_id,
-                    await send_message(chat_id, f"{title} {MESSAGES.video_too_large.format(int(os.path.getsize(video_path) / MiB), int(MAX_VIDEO_SIZE / MiB))}"))
+                await STATUS_MANAGER.send_or_update(chat_id, f"{title} {msgs.video_too_large.format(int(os.path.getsize(video_path) / MiB), int(MAX_VIDEO_SIZE / MiB))}")
                 video_path, video_width, video_height = await compress_video(video_path, chat_id, title)
 
             if video_path is None:
-                await send_message(chat_id, f"{title} {MESSAGES.compression_failed}")
+                await send_message(chat_id, f"{title} {msgs.compression_failed}")
                 return
 
             # with open(video_path, 'rb') as video:
-            STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.sending_video}"))
+            await STATUS_MANAGER.send_or_update(chat_id, f"{title} {msgs.sending_video}")
 
             for i in range(10):
                 print()
 
             try:
-                translated_title = translate_video_title(title, map_lang(TRANSLATION_LANG))
+                translated_title = translate_video_title(title, map_lang(translation_lang))
             except OpenAiQuotaError:
                 await send_message(ADMIN_CHAT_ID, "OpenAI quota is empty. Skipping title translation.")
                 translated_title = None
@@ -673,7 +691,7 @@ async def handle_message(message):
                 print()
 
             caption = f"{translated_title}\n\n" if translated_title is not None else ""
-            caption += f"{title}\n\n{MESSAGES.original_video}: {link}"
+            caption += f"{title}\n\n{msgs.original_video}: {link}"
 
             print(f"Compiled video path: {video_path}")
             if DEBUG:
@@ -691,7 +709,7 @@ async def handle_message(message):
             if Dir.exists(temp_dir):
                 Dir.delete(temp_dir)
         else:
-            await send_message(chat_id, f"{title} {MESSAGES.something_went_wrong}")
+            await send_message(chat_id, f"{title} {msgs.something_went_wrong}")
 
     except Exception as e:
         # Get full traceback
@@ -707,9 +725,11 @@ async def handle_message(message):
 
         # Send user-friendly message to the user
         try:
-            await send_message(chat_id, f"{title} {MESSAGES.unexpected_error}")
+            await send_message(chat_id, f"{title} {msgs.unexpected_error}")
         except telebot.apihelper.ApiException as user_send_error:
             print(f"Failed to send user-friendly error message to user {chat_id}: {user_send_error}")
+    finally:
+        await clear_status_messages(chat_id)
 
 
 async def debug_mode(video_link):
@@ -761,6 +781,8 @@ async def main():
 
     # Check for debug mode
     if args.debug:
+        global DEBUG
+        DEBUG = True
         print("Starting in DEBUG MODE...")
         # Update ADMIN_CHAT_ID if custom chat ID provided
         if args.debug_chat_id != ADMIN_CHAT_ID:

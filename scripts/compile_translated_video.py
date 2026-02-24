@@ -119,7 +119,10 @@ async def download_translations(video_link, temp_audio_dir, temp_subs_dir, chat_
     Download translated audio and subtitles using vot-cli.
     Returns: (audio_full_name, subs_full_name, subs_real_lang, success, error_message)
     """
-    from telegram_bot import run_vot_cli, format_subs, send_message, TRANSLATION_LANG, SUBS_LANG, Str, MESSAGES
+    from telegram_bot import run_vot_cli, format_subs, send_message, SUBS_LANG, Str, USER_SETTINGS
+
+    msgs = USER_SETTINGS.get_messages(chat_id)
+    translation_lang = USER_SETTINGS.get_translation_lang(chat_id)
 
     audio_name = "audio.mp3"
     subs_name = "subtitles.json"
@@ -127,14 +130,14 @@ async def download_translations(video_link, temp_audio_dir, temp_subs_dir, chat_
     subs_full_name = os.path.join(temp_subs_dir, subs_name)
 
     # Download translated audio
-    result = run_vot_cli(temp_audio_dir, audio_name, video_link, TRANSLATION_LANG, False)
+    result = run_vot_cli(temp_audio_dir, audio_name, video_link, translation_lang, False)
 
     if "Нейросети не смогли определить речь на видео" in result.stdout.decode('utf-8'):
-        await send_message(chat_id, f"{title} {MESSAGES.no_speech_detected}")
+        await send_message(chat_id, f"{title} {msgs.no_speech_detected}")
         return None, None, None, False, "no_speech"
 
     if "is unknown service" in result.stderr.decode('utf-8'):
-        await send_message(chat_id, f"{title} {MESSAGES.unsupported_site}")
+        await send_message(chat_id, f"{title} {msgs.unsupported_site}")
         return None, None, None, False, "unknown_service"
 
     if result.returncode != 0:
@@ -225,8 +228,11 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
     """
     from telegram_bot import (
         get_video_codec,
-        map_lang, TRANSLATION_LANG, SUBS_LANG, DEBUG, send_message
+        map_lang, SUBS_LANG, DEBUG, send_message, USER_SETTINGS
     )
+
+    translation_lang = USER_SETTINGS.get_translation_lang(chat_id)
+    msgs = USER_SETTINGS.get_messages(chat_id)
 
     video_bitrate, audio_bitrate, width, height = get_new_video_info(video_path)
 
@@ -325,14 +331,14 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
 
         # Metadata
         command += [
-            '-metadata:s:a:0', f'language={map_lang(TRANSLATION_LANG)}',
+            '-metadata:s:a:0', f'language={map_lang(translation_lang)}',
             '-metadata:s:a:1', f'language={subs_real_lang_mapped}',
         ]
 
         subtitle_stream_counter = 0
         if has_translated_subs:
             command += [
-                f'-metadata:s:s:{subtitle_stream_counter}', f'language={map_lang(TRANSLATION_LANG)}',
+                f'-metadata:s:s:{subtitle_stream_counter}', f'language={map_lang(translation_lang)}',
                 f'-metadata:s:s:{subtitle_stream_counter}', 'title=Translated',
             ]
             subtitle_stream_counter += 1
@@ -365,7 +371,7 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
 
     if used_fallback:
         print("Used software encoding fallback (libx264)")
-        await send_message(chat_id, f"{title} {MESSAGES.hw_accel_unavailable}")
+        await send_message(chat_id, f"{title} {msgs.hw_accel_unavailable}")
 
     print(f"ffmpeg completed with return code: {result.returncode}")
 
@@ -376,14 +382,17 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
         return None
 
 
-async def compile_translated_video(video_link, chat_id, title):
+async def compile_translated_video(video_link, chat_id, title, status_manager):
     """
     Main function to compile translated video.
     Refactored into smaller, manageable functions for better maintainability.
     """
     from telegram_bot import (
-        STATUS_MANAGER, send_message, download_video, get_thumbnail, MESSAGES
+        send_message, download_video, get_thumbnail, USER_SETTINGS
     )
+    STATUS_MANAGER = status_manager
+
+    MESSAGES = USER_SETTINGS.get_messages(chat_id)
 
     # Step 1: Setup temporary folder structure
     temp_dir, temp_video_dir, temp_audio_dir, temp_subs_dir, temp_thumbnail_dir = setup_temp_folders()
@@ -398,7 +407,7 @@ async def compile_translated_video(video_link, chat_id, title):
     if original_subs_path:
         print(f"Downloaded original subtitles: {original_subs_path} (language: {original_subs_lang})")
 
-    STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.video_downloaded_translating}"))
+    await STATUS_MANAGER.send_or_update(chat_id, f"{title} {MESSAGES.video_downloaded_translating}")
 
     # Step 3: Download translations (audio and subtitles)
     # This now properly handles vot-cli calls - fixed the duplicate call issue!
@@ -411,7 +420,7 @@ async def compile_translated_video(video_link, chat_id, title):
         is_known_error = error_msg in ["no_speech", "unknown_service"]
         return None, None, None, None, is_known_error, None
 
-    STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.translation_done_mixing}"))
+    await STATUS_MANAGER.send_or_update(chat_id, f"{title} {MESSAGES.translation_done_mixing}")
 
     # Step 4: Mix audio separately (30% original + 100% translated)
     mixed_audio_path = os.path.join(temp_audio_dir, "mixed_audio.mp3")
@@ -426,7 +435,7 @@ async def compile_translated_video(video_link, chat_id, title):
         await send_message(chat_id, f"{title} {MESSAGES.audio_mixing_error}")
         return None, None, None, None, False, None
 
-    STATUS_MANAGER.add(chat_id, await send_message(chat_id, f"{title} {MESSAGES.assembling_video}"))
+    await STATUS_MANAGER.send_or_update(chat_id, f"{title} {MESSAGES.assembling_video}")
 
     # Step 5: Assemble final video with all streams
     final_video_full_name = f"{os.path.splitext(video_full_name)[0]}_final.mp4"
