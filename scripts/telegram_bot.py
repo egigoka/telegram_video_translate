@@ -457,10 +457,10 @@ def map_lang(lang):
 
 
 def run_vot_cli(temp_dir, output_name, video_link, lang, is_subs):
-    command = ['vot-cli', '--output', temp_dir, '--reslang', lang,
-               "--output-file", output_name, video_link]
+    command = ['vot-cli', '--out', temp_dir, '--reslang', lang,
+               '--outfile', os.path.splitext(output_name)[0], video_link]
     if is_subs:
-        command.insert(3, '--subs')
+        command[3:3] = ['--subs', '--subs-format', 'json']
     result = subprocess.run(command,
                             stderr=subprocess.PIPE,
                             stdout=subprocess.PIPE)

@@ -1,5 +1,9 @@
 # secrets
 scripts/secrets_.py
+scripts/user_settings.json
+
+# Local tools
+.claude/
 
 # macOS
 .DS_Store
