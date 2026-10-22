@@ -1,5 +1,4 @@
 import os
-import json
 import subprocess
 import uuid
 import ffmpeg
@@ -119,7 +118,7 @@ async def download_translations(video_link, temp_audio_dir, temp_subs_dir, chat_
     Download translated audio and subtitles using vot-cli.
     Returns: (audio_full_name, subs_full_name, subs_real_lang, success, error_message)
     """
-    from telegram_bot import run_vot_cli, format_subs, send_message, SUBS_LANG, Str, USER_SETTINGS
+    from telegram_bot import run_vot_cli, format_subs, send_message, USER_SETTINGS
 
     msgs = USER_SETTINGS.get_messages(chat_id)
     translation_lang = USER_SETTINGS.get_translation_lang(chat_id)
@@ -131,48 +130,43 @@ async def download_translations(video_link, temp_audio_dir, temp_subs_dir, chat_
 
     # Download translated audio
     result = run_vot_cli(temp_audio_dir, audio_name, video_link, translation_lang, False)
+    stdout = result.stdout.decode('utf-8', errors='replace')
+    stderr = result.stderr.decode('utf-8', errors='replace')
 
-    if "Нейросети не смогли определить речь на видео" in result.stdout.decode('utf-8'):
+    print(stdout)
+    print(stderr)
+
+    if "Нейросети не смогли определить речь на видео" in stdout:
         await send_message(chat_id, f"{title} {msgs.no_speech_detected}")
         return None, None, None, False, "no_speech"
 
-    if "is unknown service" in result.stderr.decode('utf-8'):
+    if "is unknown service" in stderr:
         await send_message(chat_id, f"{title} {msgs.unsupported_site}")
         return None, None, None, False, "unknown_service"
 
-    if result.returncode != 0:
-        await send_message(chat_id, title + " " + result.stderr.decode('utf-8'))
+    if (result.returncode != 0 or
+            not os.path.isfile(audio_full_name) or
+            os.path.getsize(audio_full_name) == 0):
+        print(f"vot-cli audio download failed with exit code {result.returncode}")
         return None, None, None, False, "audio_error"
 
-    print(result.stdout.decode('utf-8'))
-    print(result.stderr.decode('utf-8'))
+    # Download subtitles in the same language as the translated audio.
+    result = run_vot_cli(temp_subs_dir, subs_name, video_link, translation_lang, True)
+    subs_real_lang = translation_lang
 
-    # Download subtitles - FIXED: removed duplicate vot-cli call
-    result = run_vot_cli(temp_subs_dir, subs_name, video_link, SUBS_LANG, True)
+    stdout = result.stdout.decode('utf-8', errors='replace')
+    stderr = result.stderr.decode('utf-8', errors='replace')
 
-    subs_real_lang = None
-    try:
-        json_subs_langs = Str.substring(result.stdout.decode('utf-8'), "): \"", "\n]\"")
-        json_subs_langs = json.loads(json_subs_langs + "]")
-        subs_lang_json = json_subs_langs[0]["language"]
-        if subs_lang_json == SUBS_LANG:
-            subs_real_lang = SUBS_LANG
-        else:
-            subs_real_lang = subs_lang_json
-            # Re-download with correct language
-            result = run_vot_cli(temp_subs_dir, subs_name, video_link, subs_lang_json, True)
-    except (KeyError, IndexError, json.JSONDecodeError):
-        pass
+    print(stdout)
+    print(stderr)
 
-    if result.returncode != 0:
-        await send_message(chat_id, title + " " + result.stderr.decode('utf-8'))
+    if (result.returncode != 0 or
+            not os.path.isfile(subs_full_name) or
+            os.path.getsize(subs_full_name) == 0):
+        print(f"vot-cli subtitle download failed with exit code {result.returncode}")
         return None, None, None, False, "subs_error"
 
-    print(result.stdout.decode('utf-8'))
-    print(result.stderr.decode('utf-8'))
-
-    if os.path.exists(subs_full_name):
-        format_subs(subs_full_name)
+    format_subs(subs_full_name)
 
     return audio_full_name, subs_full_name, subs_real_lang, True, None
 
@@ -228,7 +222,7 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
     """
     from telegram_bot import (
         get_video_codec,
-        map_lang, SUBS_LANG, DEBUG, send_message, USER_SETTINGS
+        map_lang, DEBUG, send_message, USER_SETTINGS
     )
 
     translation_lang = USER_SETTINGS.get_translation_lang(chat_id)
@@ -246,7 +240,7 @@ async def assemble_final_video(video_path, mixed_audio_path, translated_subs_pat
     try:
         subs_real_lang_mapped = map_lang(subs_real_lang)
     except (KeyError, TypeError):
-        subs_real_lang_mapped = map_lang(SUBS_LANG)
+        subs_real_lang_mapped = map_lang(translation_lang)
 
     def build_command(encoder, vf_template, hwaccel_args, extra_encoder_args):
         command = ["ffmpeg"]
@@ -416,7 +410,6 @@ async def compile_translated_video(video_link, chat_id, title, status_manager):
     )
 
     if not success:
-        # Error message already sent in download_translations
         is_known_error = error_msg in ["no_speech", "unknown_service"]
         return None, None, None, None, is_known_error, None
 

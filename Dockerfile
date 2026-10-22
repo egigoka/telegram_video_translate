@@ -6,7 +6,8 @@ COPY scripts /usr/src/app/scripts
 RUN chmod +x /usr/src/app/scripts/update_vot_cli.sh
 RUN cp /usr/src/app/scripts/session.session /usr/src/app/session.session
 
-RUN npm install -g vot-cli
+RUN npm install -g vot-cli@2.1.0
+RUN npm install -g @openai/codex@0.146.0
 
 RUN apk update
 RUN apk add --no-cache python3
@@ -17,7 +18,7 @@ RUN apk add --no-cache py3-cffi
 RUN apk add --no-cache dav1d
 RUN apk add --no-cache mesa-va-gallium mesa-dri-gallium libva libva-utils
 RUN apk add --no-cache deno
-RUN pip install yt-dlp --break-system-packages
+RUN pip install "yt-dlp[default,curl-cffi]" --break-system-packages
 RUN apk add --no-cache jq
 RUN apk add --no-cache ffmpeg
 RUN apk add --no-cache curl
@@ -34,7 +35,7 @@ RUN apk add --no-cache fish tree shadow micro eudev
 
 RUN apk add --no-cache intel-media-driver intel-media-sdk
 
-RUN pip install git+https://github.com/egigoka/commands --break-system-packages 
+RUN pip install git+https://github.com/egigoka/commands@3acc7f87183ad23796b288b0ca209a7b607c3131 --break-system-packages
 RUN pip install git+https://github.com/egigoka/telegrame --break-system-packages
 RUN apk add --no-cache py3-opencv
 RUN pip install moviepy --no-deps --break-system-packages

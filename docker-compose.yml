@@ -5,6 +5,7 @@ services:
       network: host
     volumes:
       - ./scripts:/usr/src/app/scripts
+      - /root/.codex/auth.json:/run/secrets/codex_auth:ro
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
       - /dev/dri/renderD129:/dev/dri/renderD129

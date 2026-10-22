@@ -1,6 +1,12 @@
 #!/bin/sh
+if [ -f /run/secrets/codex_auth ]; then
+	mkdir -p /root/.codex
+	cp /run/secrets/codex_auth /root/.codex/auth.json
+	chmod 600 /root/.codex/auth.json
+fi
+
 echo "Install vot-cli"
-npm install -g vot-cli
+npm install -g vot-cli@2.1.0
 
 SCRIPT_URL=$(cat /usr/src/app/scripts/link_script.txt)
 
